@@ -5,6 +5,7 @@ from enum import Enum
 import struct
 from typing import Tuple
 import datetime
+import math
 import uuid
 import numpy as np
 from timecode import Timecode
@@ -88,15 +89,15 @@ class PyLiveLinkFace:
         self.uuid = uuid
         self.name = name
         self.fps = fps
-        self._filter_size = filter_size
 
+        self._filter_size = filter_size
         self._version = 6
-        now = datetime.datetime.now()
-        timcode = Timecode(
-            self._fps, f'{now.hour}:{now.minute}:{now.second}:{now.microsecond * 0.001}')
-        self._frames = timcode.frames
-        self._sub_frame = 1056060032                # I don't know how to calculate this
-        self._denominator = int(self._fps / 60)     # 1 most of the time
+
+        timecode, sub_frame = self.fromDatetime(datetime.datetime.now())
+
+        self._frames = timecode.frames
+        self._sub_frame = sub_frame
+
         self._blend_shapes = [0.000] * 61
         self._old_blend_shapes = []                 # used for filtering
         for i in range(61):
@@ -131,8 +132,61 @@ class PyLiveLinkFace:
         if value < 1:
             raise ValueError("Only fps values greater than 1 are allowed.")
         self._fps = value
+        self._denominator = 1000 if float(self._fps) - int(self._fps) > 0 else 1
 
-    def encode(self) -> bytes:
+    @staticmethod
+    def toFrameNumber(fps: float, hours: int, minutes: int, seconds: int, frames: int, bDropFrameFormat: bool = False):
+        nFramesInSecond = math.ceil(fps)
+        nFramesInMinute = nFramesInSecond * 60
+        nFramesInHour = nFramesInMinute * 60
+        if nFramesInSecond <= 0:
+            return 0
+
+        safeSeconds = seconds + frames / nFramesInSecond
+        safeFrames = frames % nFramesInSecond
+
+        safeMinutes = minutes + safeSeconds / 60
+        safeSeconds %= 60
+        
+        safeHours = hours + safeMinutes / 60
+        safeMinutes %= 60
+
+        totalFrames = 0
+        if bDropFrameFormat:
+            nTimecodesToDrop = 2 if nFramesInSecond <= 30 else 4
+            totalMinutes = safeHours * 60 + safeMinutes
+            totalDroppedFrames = nTimecodesToDrop * (totalMinutes - int(totalMinutes / 10.0))
+            totalFrames = safeHours * nFramesInHour + safeMinutes * nFramesInMinute + safeSeconds * nFramesInSecond + safeFrames - totalDroppedFrames
+        else:
+            totalFrames = safeHours * nFramesInHour + safeMinutes * nFramesInMinute + safeSeconds * nFramesInSecond + safeFrames
+        
+        return totalFrames
+    
+    @staticmethod
+    def fromFrameNumber(fps: float, frameNumber: int, bDropFrame: bool = False):
+        nFramesInSecond = math.ceil(fps)
+        nFramesInMinute = nFramesInSecond * 60
+        nFramesInHour = nFramesInMinute * 60
+        if nFramesInSecond <= 0:
+            return 0
+
+        if bDropFrame:
+            # TODO
+            pass
+        else:
+            hours = int(frameNumber / nFramesInHour)
+            minutes = int(frameNumber / nFramesInMinute) % 60
+            seconds = int(frameNumber / nFramesInSecond) % 60
+            frames = frameNumber % nFramesInSecond
+            return (hours, minutes, seconds, frames)
+
+    def fromDatetime(self, dtime: datetime.datetime):
+        now = dtime
+        timecode = Timecode(self._fps, f'{now.hour}:{now.minute}:{now.second}:{now.microsecond * self._fps / 1e6}')
+        sub_frame = (now.microsecond * self._fps / 1e6) % 1
+        return timecode, sub_frame
+
+    def encode(self, timecode: Timecode = None, sub_frame: float = 0.0) -> bytes:
         """ Encodes the PyLiveLinkFace object into a bytes object so it can be 
         send over a network. """              
         
@@ -141,11 +195,15 @@ class PyLiveLinkFace:
         name_lenght_packed = struct.pack('!i', len(self._name))
         name_packed = bytes(self._name, 'utf-8')
 
-        now = datetime.datetime.now()
-        timcode = Timecode(
-            self._fps, f'{now.hour}:{now.minute}:{now.second}:{now.microsecond * 0.001}')
-        frames_packed = struct.pack("!II", timcode.frames, self._sub_frame)  
-        frame_rate_packed = struct.pack("!II", self._fps, self._denominator)
+        if timecode is None:
+            now = datetime.datetime.now()
+            timecode, sub_frame = self.fromDatetime(now)
+
+        # FLiveLinkMetaData, FQualifiedFrameTime Part, 
+        #   ref Timecode.h
+        frames_packed = struct.pack("!If", timecode.frames, sub_frame)     # FFrameTime
+        frame_rate_packed = struct.pack("!II", int(self._fps * self._denominator), self._denominator)    # FFrameRate
+
         data_packed = struct.pack('!B61f', 61, *self._blend_shapes)
         
         return version_packed + uuiid_packed + name_lenght_packed + name_packed + \
@@ -190,12 +248,13 @@ class PyLiveLinkFace:
         None
         """
 
+        bsidx = index.value if type(index) is FaceBlendShape else index
         if no_filter:
-            self._blend_shapes[index.value] = value
+            self._blend_shapes[bsidx] = value
         else:
-            self._old_blend_shapes[index.value].append(value)
-            filterd_value = mean(self._old_blend_shapes[index.value])
-            self._blend_shapes[index.value] = filterd_value
+            self._old_blend_shapes[bsidx].append(value)
+            filterd_value = mean(self._old_blend_shapes[bsidx])
+            self._blend_shapes[bsidx] = filterd_value
 
     @staticmethod
     def decode(bytes_data: bytes) -> Tuple[bool, PyLiveLinkFace]:
@@ -225,8 +284,9 @@ class PyLiveLinkFace:
         if len(bytes_data) > name_end_pos + 16:
 
             #FFrameTime, FFrameRate and data length
-            frame_number, sub_frame, fps, denominator, data_length = struct.unpack(
+            frame_number, sub_frame, fps_numerator, denominator, data_length = struct.unpack(
                 "!if2ib", bytes_data[name_end_pos:name_end_pos + 17])
+            fps = fps_numerator / denominator
 
             if data_length != 61:
                 raise ValueError(
